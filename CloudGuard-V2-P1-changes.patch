@@ -1,0 +1,1372 @@
+--- a/README.md
++++ b/README.md
+@@ -329,10 +329,10 @@
+ 
+ ### Chapter 4 evaluation
+ 
+-Copy `evaluation/ground_truth_template.csv` to `evaluation/ground_truth.csv`, edit the expected PASS/FAIL labels to match your controlled test resources, run an authorised scan separately, export its findings CSV from the scan details page, then run:
++Copy `evaluation/ground_truth_template.csv` to `evaluation/ground_truth.csv`, then replace the sample resource types and exact resource identifiers with the controlled resources used in your experiment and set each expected label to `PASS` or `FAIL`. Run an authorised scan separately, export its findings CSV from the scan details page, then run:
+ 
+ ```powershell
+ python evaluation/evaluate.py evaluation/ground_truth.csv cloudguard_scan_1.csv
+ ```
+ 
+-The CSV contains the rule ID, resource and supporting finding fields. Findings without a mapped rule ID remain visible in the export but are not automatically treated as a Chapter 4 match.
++The findings CSV contains `rule_id`, `resource_type`, and `resource_id` in addition to the legacy `resource` display column and supporting finding fields. Evaluation matches only on an exact, case-sensitive resource type, resource identifier, and rule ID; it does not use substring matching. Ground-truth rows with empty identity fields, labels other than `PASS` or `FAIL`, or duplicate `(resource_type, resource_id, rule_id)` records are rejected. Findings without a mapped rule ID remain visible as unlabelled findings and are not counted as Chapter 4 matches. The template includes only checks currently implemented and mapped by the scanners; for example, it excludes EBS encryption-by-default and the no-customer-managed-CloudTrail-trail check.
+--- a/cloudguard/core/export.py
++++ b/cloudguard/core/export.py
+@@ -3,6 +3,15 @@
+ import io
+ 
+ from cloudguard.core.rules import CHECK_TO_RULE
++
++RESOURCE_TYPE_BY_SERVICE = {
++    "S3": "s3_bucket",
++    "EC2": "ec2_security_group",
++    "IAM": "iam_user",
++    "EBS": "ebs_volume",
++    "RDS": "rds_db_instance",
++    "CLOUDTRAIL": "cloudtrail_trail",
++}
+ 
+ 
+ def findings_to_csv(details):
+@@ -10,14 +19,17 @@
+     output = io.StringIO(newline="")
+     writer = csv.writer(output)
+     writer.writerow([
+-        "rule_id", "resource", "service", "check", "severity",
+-        "category", "title", "description", "recommendation"
++        "rule_id", "resource_type", "resource_id", "resource", "service",
++        "check", "severity", "category", "title", "description", "recommendation"
+     ])
+     for finding in details.get("findings", []):
+         check = finding.get("check_name") or finding.get("check") or ""
+         rule_id = finding.get("rule_id") or CHECK_TO_RULE.get(check, "")
++        service = str(finding.get("service", "")).strip().upper()
++        resource_id = str(finding.get("resource", "")).strip()
++        resource_type = finding.get("resource_type") or RESOURCE_TYPE_BY_SERVICE.get(service, "")
+         writer.writerow([
+-            rule_id, finding.get("resource", ""), finding.get("service", ""),
++            rule_id, resource_type, resource_id, resource_id, service,
+             check, finding.get("severity", ""), finding.get("category", ""),
+             finding.get("title", ""), finding.get("description", ""),
+             finding.get("recommendation", "")
+--- a/cloudguard/core/rules.py
++++ b/cloudguard/core/rules.py
+@@ -144,7 +144,8 @@
+         rule = RULES[rule_id]
+         finding["rule_id"] = rule_id
+         finding["category"] = rule["category"]
+-        # One source of truth for mapped rule severity and remediation text.
+-        finding["severity"] = rule["severity"]
+-        finding["recommendation"] = rule["recommendation"]
++        # Scanner-specific context takes precedence. The catalogue supplies
++        # defaults only when a scanner did not provide these fields.
++        finding.setdefault("severity", rule["severity"])
++        finding.setdefault("recommendation", rule["recommendation"])
+     return finding
+--- a/cloudguard/scanners/s3_scanner.py
++++ b/cloudguard/scanners/s3_scanner.py
+@@ -1,4 +1,3 @@
+-
+ """
+ CloudGuard - S3 Security Scanner
+ 
+@@ -8,12 +7,11 @@
+ 3. Bucket-level Block Public Access
+ 4. Account-level Block Public Access
+ 
+-A missing protection setting is not automatically
+-treated as proof of public exposure.
++Block Public Access is evaluated per setting as enabled, disabled, or
++unknown. An inaccessible configuration is never treated as disabled.
+ """
+ 
+ import boto3
+-
+ from botocore.exceptions import ClientError
+ 
+ 
+@@ -22,25 +20,29 @@
+     "http://acs.amazonaws.com/groups/global/AuthenticatedUsers",
+ }
+ 
++BPA_FLAGS = (
++    "BlockPublicAcls",
++    "IgnorePublicAcls",
++    "BlockPublicPolicy",
++    "RestrictPublicBuckets",
++)
++
+ 
+ class S3Scanner:
+-
+     def __init__(self, session=None):
+         self.session = session or boto3.Session(
+             profile_name="cloudguard-audit",
+-            region_name="eu-north-1"
+-        )
+-
++            region_name="eu-north-1",
++        )
+         self.s3 = self.session.client("s3")
+         self.s3control = self.session.client("s3control")
+         self.sts = self.session.client("sts")
+-
+         self.findings = []
+         self.errors = []
+ 
+     def add_finding(
+-        self, bucket, check, severity,
+-        title, description, recommendation, evidence=None
++        self, bucket, check, severity, title, description,
++        recommendation, evidence=None,
+     ):
+         self.findings.append({
+             "service": "S3",
+@@ -50,217 +52,257 @@
+             "title": title,
+             "description": description,
+             "recommendation": recommendation,
+-            "evidence": evidence or {}
++            "evidence": evidence or {},
+         })
+ 
+     @staticmethod
+     def error_code(error):
+-        return error.response.get("Error", {}).get(
+-            "Code", "UnknownError"
+-        )
++        if isinstance(error, ClientError):
++            return error.response.get("Error", {}).get("Code", "UnknownError")
++        return type(error).__name__
++
++    def _record_configuration_error(self, resource, scope, operation, error):
++        """Keep account and bucket configuration failures independently visible."""
++        self.errors.append({
++            "resource": resource,
++            "scope": scope,
++            "operation": operation,
++            "error": self.error_code(error),
++            "message": str(error),
++        })
+ 
+     def get_account_public_access_block(self, account_id):
+         try:
+-            response = self.s3control.get_public_access_block(
+-                AccountId=account_id
+-            )
+-            return response.get("PublicAccessBlockConfiguration", {})
+-
++            response = self.s3control.get_public_access_block(AccountId=account_id)
++            configuration = response.get("PublicAccessBlockConfiguration")
++            # A successful response containing no configuration is treated as
++            # an absent configuration (all flags disabled), like NoSuch... .
++            return configuration if configuration is not None else {}
+         except ClientError as error:
+-            code = self.error_code(error)
+-
+-            if code == "NoSuchPublicAccessBlockConfiguration":
++            if self.error_code(error) == "NoSuchPublicAccessBlockConfiguration":
+                 return {}
+-
+-            self.errors.append({
+-                "resource": "AWS Account",
+-                "operation": "GetAccountPublicAccessBlock",
+-                "error": code
+-            })
++            self._record_configuration_error(
++                "AWS Account", "account", "GetAccountPublicAccessBlock", error
++            )
+             return None
++        except Exception as error:
++            self._record_configuration_error(
++                "AWS Account", "account", "GetAccountPublicAccessBlock", error
++            )
++            return None
+ 
+     def get_bucket_public_access_block(self, bucket):
+         try:
+-            response = self.s3.get_public_access_block(
+-                Bucket=bucket
+-            )
+-            return response.get("PublicAccessBlockConfiguration", {})
+-
++            response = self.s3.get_public_access_block(Bucket=bucket)
++            configuration = response.get("PublicAccessBlockConfiguration")
++            return configuration if configuration is not None else {}
+         except ClientError as error:
+-            code = self.error_code(error)
+-
+-            if code == "NoSuchPublicAccessBlockConfiguration":
++            if self.error_code(error) == "NoSuchPublicAccessBlockConfiguration":
+                 return {}
+-
++            self._record_configuration_error(
++                bucket, "bucket", "GetPublicAccessBlock", error
++            )
++            return None
++        except Exception as error:
++            self._record_configuration_error(
++                bucket, "bucket", "GetPublicAccessBlock", error
++            )
++            return None
++
++    @staticmethod
++    def effective_flag(flag, account_block, bucket_block):
++        """Return enabled, disabled, or unknown for an account/bucket flag.
++
++        A confirmed True at either level enables the effective control. The
++        control is disabled only when both levels were successfully inspected
++        and neither enables it. Otherwise its effective state is unknown.
++        """
++        configurations = (account_block, bucket_block)
++        if any(
++            configuration is not None and bool(configuration.get(flag, False))
++            for configuration in configurations
++        ):
++            return "enabled"
++        if any(configuration is None for configuration in configurations):
++            return "unknown"
++        return "disabled"
++
++    def _add_unknown_protection_finding(self, bucket, check, title, message, evidence):
++        self.add_finding(
++            bucket,
++            check,
++            "INFO",
++            title,
++            message,
++            "Grant the read-only audit role permission to retrieve both account- and bucket-level "
++            "S3 Block Public Access settings, then repeat the assessment.",
++            evidence,
++        )
++
++    def check_bucket_policy(self, bucket, account_block, bucket_block):
++        try:
++            response = self.s3.get_bucket_policy_status(Bucket=bucket)
++            is_public = response.get("PolicyStatus", {}).get("IsPublic", False)
++        except ClientError as error:
++            if self.error_code(error) == "NoSuchBucketPolicy":
++                return
+             self.errors.append({
+                 "resource": bucket,
+-                "operation": "GetPublicAccessBlock",
+-                "error": code
+-            })
+-            return None
+-
+-    def check_bucket_policy(self, bucket, account_block, bucket_block):
+-
+-        try:
+-            response = self.s3.get_bucket_policy_status(
+-                Bucket=bucket
+-            )
+-            is_public = response.get("PolicyStatus", {}).get(
+-                "IsPublic", False
+-            )
+-
+-        except ClientError as error:
+-            code = self.error_code(error)
+-
+-            if code == "NoSuchBucketPolicy":
+-                return
+-
++                "scope": "bucket",
++                "operation": "GetBucketPolicyStatus",
++                "error": self.error_code(error),
++                "message": str(error),
++            })
++            return
++        except Exception as error:
+             self.errors.append({
+                 "resource": bucket,
++                "scope": "bucket",
+                 "operation": "GetBucketPolicyStatus",
+-                "error": code
++                "error": self.error_code(error),
++                "message": str(error),
+             })
+             return
+ 
+         if not is_public:
+             return
+ 
+-        # RestrictPublicBuckets can restrict access to
+-        # buckets with public policies.
+-        restricted = (
+-            (account_block or {}).get("RestrictPublicBuckets", False)
+-            or
+-            (bucket_block or {}).get("RestrictPublicBuckets", False)
+-        )
+-
+-        if restricted:
++        protection_state = self.effective_flag(
++            "RestrictPublicBuckets", account_block, bucket_block
++        )
++        evidence = {
++            "is_public": True,
++            "restrict_public_buckets_state": protection_state,
++        }
++
++        if protection_state == "unknown":
++            self._add_unknown_protection_finding(
++                bucket,
++                "PUBLIC_BUCKET_POLICY_PROTECTION_UNKNOWN",
++                "Public bucket policy detected; effective restriction is unknown",
++                "AWS identifies this policy as public, but CloudGuard could not determine whether "
++                "account- or bucket-level RestrictPublicBuckets neutralises public access. "
++                "This is inconclusive and is not classified as confirmed public exposure.",
++                evidence,
++            )
++            return
++
++        if protection_state == "enabled":
+             severity = "MEDIUM"
+             title = "Public policy detected with access restriction"
+             description = (
+-                "AWS identifies the bucket policy as public, "
+-                "but RestrictPublicBuckets is enabled at the "
+-                "bucket or account level."
++                "AWS identifies the bucket policy as public, but RestrictPublicBuckets is "
++                "enabled at the account or bucket level."
+             )
+             recommendation = (
+-                "Review the policy and remove unnecessary public "
+-                "access. Verify effective access restrictions."
++                "Review the policy and remove unnecessary public access. Verify effective access restrictions."
+             )
+         else:
+             severity = "HIGH"
+             title = "Public bucket policy detected"
+             description = (
+-                "AWS identifies this bucket policy as public, "
+-                "and no applicable RestrictPublicBuckets setting "
+-                "was detected."
++                "AWS identifies this bucket policy as public, and neither the account nor bucket "
++                "configuration enables RestrictPublicBuckets."
+             )
+             recommendation = (
+-                "Review the bucket policy and remove unintended "
+-                "public access. Enable appropriate Block Public "
+-                "Access protections."
++                "Review the bucket policy and remove unintended public access. Enable appropriate "
++                "Block Public Access protections."
+             )
+ 
+         self.add_finding(
+-            bucket,
+-            "PUBLIC_BUCKET_POLICY",
+-            severity,
+-            title,
+-            description,
+-            recommendation,
+-            {"is_public": True, "restricted": restricted}
++            bucket, "PUBLIC_BUCKET_POLICY", severity, title,
++            description, recommendation, evidence,
+         )
+ 
+     def check_bucket_acl(self, bucket, account_block, bucket_block):
+-
+         try:
+             response = self.s3.get_bucket_acl(Bucket=bucket)
+-
+         except ClientError as error:
+             self.errors.append({
+                 "resource": bucket,
++                "scope": "bucket",
+                 "operation": "GetBucketAcl",
+-                "error": self.error_code(error)
++                "error": self.error_code(error),
++                "message": str(error),
++            })
++            return
++        except Exception as error:
++            self.errors.append({
++                "resource": bucket,
++                "scope": "bucket",
++                "operation": "GetBucketAcl",
++                "error": self.error_code(error),
++                "message": str(error),
+             })
+             return
+ 
+         public_grants = []
+-
+         for grant in response.get("Grants", []):
+             grantee = grant.get("Grantee", {})
+             uri = grantee.get("URI")
+-
+             if uri in PUBLIC_GROUPS:
+                 public_grants.append({
+                     "permission": grant.get("Permission"),
+-                    "group": uri
++                    "group": uri,
+                 })
+ 
+         if not public_grants:
+             return
+ 
+-        # IgnorePublicAcls prevents public ACL grants
+-        # from granting access.
+-        ignored = (
+-            (account_block or {}).get("IgnorePublicAcls", False)
+-            or
+-            (bucket_block or {}).get("IgnorePublicAcls", False)
+-        )
+-
+-        if ignored:
++        protection_state = self.effective_flag(
++            "IgnorePublicAcls", account_block, bucket_block
++        )
++        evidence = {
++            "public_grants": public_grants,
++            "ignore_public_acls_state": protection_state,
++        }
++
++        if protection_state == "unknown":
++            self._add_unknown_protection_finding(
++                bucket,
++                "PUBLIC_BUCKET_ACL_PROTECTION_UNKNOWN",
++                "Public ACL grants detected; effective ACL handling is unknown",
++                "The bucket ACL contains public grants, but CloudGuard could not determine whether "
++                "account- or bucket-level IgnorePublicAcls prevents them from granting access. "
++                "This is inconclusive and is not classified as confirmed public exposure.",
++                evidence,
++            )
++            return
++
++        if protection_state == "enabled":
+             severity = "LOW"
+             title = "Public ACL grants detected but ignored"
+             description = (
+-                "The bucket ACL contains public grants, "
+-                "but IgnorePublicAcls is enabled."
++                "The bucket ACL contains public grants, but IgnorePublicAcls is enabled at the "
++                "account or bucket level."
+             )
+             recommendation = (
+-                "Remove unnecessary public ACL grants and "
+-                "prefer bucket policies with Block Public Access."
++                "Remove unnecessary public ACL grants and prefer bucket policies with Block Public Access."
+             )
+         else:
+             severity = "HIGH"
+             title = "Public bucket ACL detected"
+             description = (
+-                "The bucket ACL grants permissions to a public "
+-                "or broadly authenticated AWS group."
++                "The bucket ACL grants permissions to a public or broadly authenticated AWS group, "
++                "and neither account nor bucket configuration enables IgnorePublicAcls."
+             )
+             recommendation = (
+-                "Remove unintended public ACL grants and enable "
+-                "IgnorePublicAcls or appropriate Block Public Access."
++                "Remove unintended public ACL grants and enable IgnorePublicAcls or appropriate "
++                "Block Public Access protections."
+             )
+ 
+         self.add_finding(
+-            bucket,
+-            "PUBLIC_BUCKET_ACL",
+-            severity,
+-            title,
+-            description,
+-            recommendation,
+-            {"public_grants": public_grants, "ignored": ignored}
++            bucket, "PUBLIC_BUCKET_ACL", severity, title,
++            description, recommendation, evidence,
+         )
+ 
+     def check_block_public_access(self, bucket, account_block, bucket_block):
+-
+-        if account_block is None or bucket_block is None:
+-            return
+-
+-        account_flags = account_block or {}
+-        bucket_flags = bucket_block or {}
+-
+-        flags = [
+-            "BlockPublicAcls",
+-            "IgnorePublicAcls",
+-            "BlockPublicPolicy",
+-            "RestrictPublicBuckets"
+-        ]
+-
+-        # Each control is effective when enabled at either account OR bucket
+-        # level. Missing keys are False, matching AWS's default semantics.
+-        enabled = {
+-            flag: bool(account_flags.get(flag, False))
+-                  or bool(bucket_flags.get(flag, False))
+-            for flag in flags
++        states = {
++            flag: self.effective_flag(flag, account_block, bucket_block)
++            for flag in BPA_FLAGS
+         }
+-        disabled = [flag for flag, is_enabled in enabled.items() if not is_enabled]
++        disabled = [flag for flag, state in states.items() if state == "disabled"]
++        unknown = [flag for flag, state in states.items() if state == "unknown"]
+ 
+         if disabled:
+             self.add_finding(
+@@ -268,89 +310,139 @@
+                 "BLOCK_PUBLIC_ACCESS_DISABLED",
+                 "MEDIUM",
+                 "Some Block Public Access protections are not enabled",
+-                (
+-                    "The following effective Block Public Access controls "
+-                    "are not enabled at either account or bucket level: "
+-                    + ", ".join(disabled) + "."
+-                ),
+-                (
+-                    "Enable all four S3 Block Public Access settings at "
+-                    "account level, or apply the required settings to this "
+-                    "bucket after reviewing documented exceptions."
+-                ),
+-                {"effective_protection_flags": enabled, "disabled_flags": disabled}
+-            )
++                "The following effective Block Public Access controls are confirmed disabled: "
++                + ", ".join(disabled) + "."
++                + (" The following controls could not be determined: " + ", ".join(unknown) + "." if unknown else ""),
++                "Enable all four S3 Block Public Access settings at account level, or apply the "
++                "required settings to this bucket after reviewing documented exceptions.",
++                {
++                    "effective_protection_flags": states,
++                    "disabled_flags": disabled,
++                    "unknown_flags": unknown,
++                },
++            )
++
++        if unknown:
++            self._add_unknown_protection_finding(
++                bucket,
++                "BLOCK_PUBLIC_ACCESS_CONFIGURATION_UNKNOWN",
++                "Some Block Public Access settings could not be determined",
++                "CloudGuard could not retrieve all account- and bucket-level configuration needed "
++                "to determine effective protection for: " + ", ".join(unknown) + ".",
++                {
++                    "effective_protection_flags": states,
++                    "disabled_flags": disabled,
++                    "unknown_flags": unknown,
++                },
++            )
++        return states
+ 
+     def scan(self):
+-
+         self.findings = []
+         self.errors = []
+-
+-        identity = self.sts.get_caller_identity()
+-        account_id = identity["Account"]
+-
+-        account_block = self.get_account_public_access_block(
+-            account_id
+-        )
++        attempted_buckets = 0
++        successfully_inspected_buckets = 0
++
++        try:
++            identity = self.sts.get_caller_identity()
++            account_id = identity["Account"]
++        except Exception as error:
++            self.errors.append({
++                "resource": "AWS Account",
++                "scope": "account",
++                "operation": "GetCallerIdentity",
++                "error": self.error_code(error),
++                "message": str(error),
++            })
++            return self._scan_result(0, attempted_buckets, successfully_inspected_buckets)
++
++        account_block = self.get_account_public_access_block(account_id)
+ 
+         try:
+             buckets = self.s3.list_buckets().get("Buckets", [])
+-
+-        except ClientError as error:
+-            return {
+-                "service": "S3",
+-                "scanned_buckets": 0,
+-                "findings": [],
+-                "errors": [{
++        except Exception as error:
++            # Preserve account-level errors recorded before ListBuckets failed.
++            self.errors.append({
++                "resource": "AWS Account",
++                "scope": "account",
++                "operation": "ListBuckets",
++                "error": self.error_code(error),
++                "message": str(error),
++            })
++            return self._scan_result(0, attempted_buckets, successfully_inspected_buckets)
++
++        discovered_buckets = len(buckets)
++        for item in buckets:
++            bucket = item.get("Name")
++            if not bucket:
++                self.errors.append({
+                     "resource": "AWS Account",
+-                    "operation": "ListBuckets",
+-                    "error": self.error_code(error)
+-                }]
+-            }
+-
+-        for item in buckets:
+-            bucket = item["Name"]
++                    "scope": "account",
++                    "operation": "InspectBucket",
++                    "error": "InvalidBucketRecord",
++                    "message": "ListBuckets returned a bucket record without a Name.",
++                })
++                continue
++
++            attempted_buckets += 1
++            errors_before_inspection = len(self.errors)
+             try:
+                 bucket_block = self.get_bucket_public_access_block(bucket)
+                 self.check_bucket_policy(bucket, account_block, bucket_block)
+                 self.check_bucket_acl(bucket, account_block, bucket_block)
+-                self.check_block_public_access(bucket, account_block, bucket_block)
++                effective_states = self.check_block_public_access(
++                    bucket, account_block, bucket_block
++                )
+             except Exception as error:
+-                # A malformed/inaccessible bucket must not abort the account scan.
+                 self.errors.append({
+                     "resource": bucket,
++                    "scope": "bucket",
+                     "operation": "InspectBucket",
+-                    "error": self.error_code(error) if isinstance(error, ClientError) else type(error).__name__,
++                    "error": self.error_code(error),
+                     "message": str(error),
+                 })
+                 continue
+ 
++            # A complete inspection requires successful retrieval of shared
++            # account configuration and all per-bucket data used by these checks.
++            if (
++                len(self.errors) == errors_before_inspection
++                and all(state != "unknown" for state in effective_states.values())
++            ):
++                successfully_inspected_buckets += 1
++
++        return self._scan_result(
++            discovered_buckets, attempted_buckets, successfully_inspected_buckets
++        )
++
++    def _scan_result(self, discovered, attempted, successful):
+         return {
+             "service": "S3",
+-            "scanned_buckets": len(buckets),
++            "discovered_buckets": discovered,
++            "attempted_buckets": attempted,
++            "successfully_inspected_buckets": successful,
++            # Retain the historical key; it now means fully inspected buckets.
++            "scanned_buckets": successful,
+             "findings": self.findings,
+-            "errors": self.errors
++            "errors": self.errors,
+         }
+ 
+ 
+ if __name__ == "__main__":
+-
+     scanner = S3Scanner()
+     results = scanner.scan()
+-
+     print("\n========== CLOUDGUARD S3 SCAN ==========")
+-    print("Buckets scanned:", results["scanned_buckets"])
++    print("Buckets discovered:", results["discovered_buckets"])
++    print("Buckets attempted:", results["attempted_buckets"])
++    print("Buckets successfully inspected:", results["successfully_inspected_buckets"])
+     print("Findings:", len(results["findings"]))
+     print("Errors:", len(results["errors"]))
+-
+     for finding in results["findings"]:
+         print("\n----------------------------------------")
+         print("Bucket:", finding["resource"])
+         print("Severity:", finding["severity"])
+         print("Issue:", finding["title"])
+         print("Recommendation:", finding["recommendation"])
+-
+     for error in results["errors"]:
+         print("\n[SCAN ERROR]", error)
+-
+     print("\n========== SCAN COMPLETE ==========")
+--- a/evaluation/evaluate.py
++++ b/evaluation/evaluate.py
+@@ -1,67 +1,142 @@
+-"""
+-Compare a CloudGuard CSV export (or a mapped Prowler CSV) with your ground truth
+-and print the Chapter 4 metrics: TP, FP, FN, TN, accuracy, precision, recall,
+-F1-score and false positive rate.
++"""Evaluate CloudGuard findings against explicitly labelled ground truth.
++
++Ground-truth CSV schema:
++    resource_type,resource_id,rule_id,expected
++
++Finding CSVs must contain the same resource_type/resource_id pair. Matching
++is exact and case-sensitive; display names and partial identifiers are never
++used as substitutes for resource identity.
+ 
+ Usage:
+-    python evaluation/evaluate.py evaluation/ground_truth.csv cloudguard_scan_5.csv
+-
+-ground_truth.csv has one row per (resource, rule) you deliberately set up:
+-    resource,rule_id,expected
+-    cg-test-public-policy,S3-01,FAIL      <- you made this bucket public on purpose
+-    cg-test-private,S3-01,PASS            <- this bucket is private, the tool must NOT flag it
+-
+-The findings CSV needs at least the columns rule_id and resource.
+-A finding counts as a match when its rule_id is the same and the ground-truth
+-resource name appears inside the finding's resource text (so "sg-0abc" matches
+-"sg-0abc (cg-open-ssh)").
++    python evaluation/evaluate.py evaluation/ground_truth_template.csv findings.csv
+ """
+ import csv
+ import sys
+ 
+ 
++REQUIRED_GROUND_TRUTH_FIELDS = ("resource_type", "resource_id", "rule_id", "expected")
++REQUIRED_FINDING_FIELDS = ("resource_type", "resource_id")
++VALID_EXPECTATIONS = {"PASS", "FAIL"}
++
++
+ def load(path):
+-    with open(path, newline="", encoding="utf-8-sig") as fh:
+-        return list(csv.DictReader(fh))
++    with open(path, newline="", encoding="utf-8-sig") as file_handle:
++        return list(csv.DictReader(file_handle))
++
++
++def _normalized_required(row, field, row_number):
++    value = row.get(field)
++    if value is None or not str(value).strip():
++        raise ValueError(f"Ground-truth row {row_number}: {field!r} must not be empty")
++    return str(value).strip()
++
++
++def validate_ground_truth(ground_truth):
++    """Reject incomplete, unsupported, or duplicate ground-truth records."""
++    seen = set()
++    normalized = []
++    for row_number, row in enumerate(ground_truth, start=2):
++        record = {
++            field: _normalized_required(row, field, row_number)
++            for field in REQUIRED_GROUND_TRUTH_FIELDS
++            if field != "expected"
++        }
++        expected_value = row.get("expected")
++        expected = str(expected_value).strip().upper() if expected_value is not None else ""
++        if expected not in VALID_EXPECTATIONS:
++            raise ValueError(
++                f"Ground-truth row {row_number}: expected must be PASS or FAIL, "
++                f"not {expected_value!r}"
++            )
++        record["expected"] = expected
++        # Resource type + exact identifier + rule is one unique test case.
++        key = (record["resource_type"], record["resource_id"], record["rule_id"])
++        if key in seen:
++            raise ValueError(
++                f"Ground-truth row {row_number}: duplicate record for "
++                f"resource_type={key[0]!r}, resource_id={key[1]!r}, rule_id={key[2]!r}"
++            )
++        seen.add(key)
++        normalized.append(record)
++    return normalized
++
++
++def validate_findings(findings):
++    """Ensure finding input carries explicit resource identity fields."""
++    normalized = []
++    for index, finding in enumerate(findings, start=1):
++        missing = [field for field in REQUIRED_FINDING_FIELDS
++                   if finding.get(field) is None or not str(finding.get(field)).strip()]
++        if missing:
++            raise ValueError(
++                f"Finding row {index}: missing required field(s): {', '.join(missing)}"
++            )
++        normalized.append({
++            **finding,
++            "resource_type": str(finding["resource_type"]).strip(),
++            "resource_id": str(finding["resource_id"]).strip(),
++            # Unmapped scanner checks intentionally have no rule_id. Keep
++            # them as unlabelled findings rather than rejecting the whole CSV.
++            "rule_id": str(finding.get("rule_id") or "").strip(),
++        })
++    return normalized
+ 
+ 
+ def matches(gt_row, finding):
+-    return (finding["rule_id"].strip() == gt_row["rule_id"].strip()
+-            and gt_row["resource"].strip() in finding["resource"])
++    """Match only when rule, resource type, and identifier are all identical."""
++    return (
++        str(finding.get("rule_id", "")).strip() == gt_row["rule_id"]
++        and str(finding.get("resource_type", "")).strip() == gt_row["resource_type"]
++        and str(finding.get("resource_id", "")).strip() == gt_row["resource_id"]
++    )
+ 
+ 
+ def evaluate(ground_truth, findings):
++    ground_truth = validate_ground_truth(ground_truth)
++    findings = validate_findings(findings)
++
+     tp = fp = fn = tn = 0
+     detail = []
+     used = set()
+     for row in ground_truth:
+-        hit = [i for i, f in enumerate(findings) if matches(row, f)]
++        hit = [index for index, finding in enumerate(findings) if matches(row, finding)]
+         used.update(hit)
+-        expected_fail = row["expected"].strip().upper() == "FAIL"
++        expected_fail = row["expected"] == "FAIL"
+         if expected_fail and hit:
+-            tp += 1; outcome = "TP"
++            tp += 1
++            outcome = "TP"
+         elif expected_fail:
+-            fn += 1; outcome = "FN"
++            fn += 1
++            outcome = "FN"
+         elif hit:
+-            fp += 1; outcome = "FP"
++            fp += 1
++            outcome = "FP"
+         else:
+-            tn += 1; outcome = "TN"
+-        detail.append((row["resource"], row["rule_id"], row["expected"], outcome))
+-    unlabelled = [f for i, f in enumerate(findings) if i not in used]
++            tn += 1
++            outcome = "TN"
++        detail.append((
++            row["resource_type"], row["resource_id"],
++            row["rule_id"], row["expected"], outcome,
++        ))
++
++    unlabelled = [finding for index, finding in enumerate(findings) if index not in used]
+     return tp, fp, fn, tn, detail, unlabelled
+ 
+ 
+-def pct(a, b):
+-    return round(100 * a / b, 2) if b else 0.0
++def pct(numerator, denominator):
++    return round(100 * numerator / denominator, 2) if denominator else 0.0
+ 
+ 
+-def main(gt_path, findings_path):
+-    tp, fp, fn, tn, detail, unlabelled = evaluate(load(gt_path), load(findings_path))
+-    precision, recall = pct(tp, tp + fp), pct(tp, tp + fn)
++def main(ground_truth_path, findings_path):
++    tp, fp, fn, tn, detail, unlabelled = evaluate(
++        load(ground_truth_path), load(findings_path)
++    )
++    precision = pct(tp, tp + fp)
++    recall = pct(tp, tp + fn)
+     f1 = round(2 * precision * recall / (precision + recall), 2) if precision + recall else 0.0
+-    print(f"{'Resource':40} {'Rule':8} {'Expected':8} Outcome")
+-    for r in detail:
+-        print(f"{r[0]:40} {r[1]:8} {r[2]:8} {r[3]}")
++    print(f"{'Resource type':22} {'Resource ID':36} {'Rule':8} {'Expected':8} Outcome")
++    for resource_type, resource_id, rule_id, expected, outcome in detail:
++        print(f"{resource_type:22} {resource_id:36} {rule_id:8} {expected:8} {outcome}")
+     print(f"\nTP={tp}  FP={fp}  FN={fn}  TN={tn}")
+     print(f"Accuracy  = {pct(tp + tn, tp + tn + fp + fn)}%")
+     print(f"Precision = {precision}%")
+@@ -69,13 +144,15 @@
+     print(f"F1-score  = {f1}%")
+     print(f"FPR       = {pct(fp, fp + tn)}%")
+     if unlabelled:
+-        print(f"\n{len(unlabelled)} finding(s) are not in the ground truth. Check each one by hand and either add it "
+-              f"to ground_truth.csv or explain it in Chapter 4:")
+-        for f in unlabelled:
+-            print(f"  {f['rule_id']:8} {f['resource']}")
++        print(f"\n{len(unlabelled)} finding(s) are not in the ground truth:")
++        for finding in unlabelled:
++            print(f"  {finding['rule_id']:8} {finding['resource_type']} {finding['resource_id']}")
+ 
+ 
+ if __name__ == "__main__":
+     if len(sys.argv) != 3:
+         sys.exit(__doc__)
+-    main(sys.argv[1], sys.argv[2])
++    try:
++        main(sys.argv[1], sys.argv[2])
++    except (OSError, ValueError, csv.Error) as error:
++        sys.exit(f"Evaluation input error: {error}")
+--- a/evaluation/ground_truth_template.csv
++++ b/evaluation/ground_truth_template.csv
+@@ -1,14 +1,16 @@
+-resource,rule_id,expected
+-cg-test-public-policy,S3-01,FAIL
+-cg-test-public-policy,S3-03,FAIL
+-cg-test-private,S3-01,PASS
+-cg-test-private,S3-02,PASS
+-cg-test-private,S3-03,PASS
+-cg-open-ssh,EC2-01,FAIL
+-cg-open-rdp,EC2-02,FAIL
+-cg-ssh-office-only,EC2-01,PASS
+-user/cg-nomfa-user,IAM-02,FAIL
+-user/cg-admin-user,IAM-03,FAIL
+-user/cg-readonly-user,IAM-03,PASS
+-Region us-east-1,LOG-01,FAIL
+-Region us-east-1,ENC-01,FAIL
++resource_type,resource_id,rule_id,expected
++s3_bucket,cg-test-public-policy,S3-01,FAIL
++s3_bucket,cg-test-public-acl,S3-02,FAIL
++s3_bucket,cg-test-private,S3-01,PASS
++s3_bucket,cg-test-private,S3-02,PASS
++s3_bucket,cg-test-private,S3-03,PASS
++ec2_security_group,sg-0123456789abcdef0,EC2-01,FAIL
++ec2_security_group,sg-0fedcba9876543210,EC2-02,FAIL
++ec2_security_group,sg-01112222333344445,EC2-01,PASS
++iam_user,cg-nomfa-user,IAM-02,FAIL
++iam_user,cg-admin-user,IAM-03,FAIL
++iam_user,cg-readonly-user,IAM-03,PASS
++ebs_volume,vol-0123456789abcdef0,ENC-02,FAIL
++ebs_volume,vol-0fedcba9876543210,ENC-02,PASS
++cloudtrail_trail,cg-audit-trail,LOG-02,FAIL
++cloudtrail_trail,cg-secure-trail,LOG-02,PASS
+--- a/tests/test_app.py
++++ b/tests/test_app.py
+@@ -174,5 +174,5 @@
+ 
+     assert response.status_code == 200
+     assert response.mimetype == "text/csv"
+-    assert b"rule_id,resource" in response.data
+-    assert b"IAM-02,test-user" in response.data
++    assert b"rule_id,resource_type,resource_id,resource" in response.data
++    assert b"IAM-02,iam_user,test-user,test-user" in response.data
+--- /dev/null
++++ b/tests/test_p1_regressions.py
+@@ -0,0 +1,384 @@
++"""P1 regression coverage: S3 BPA certainty, rule metadata, and evaluation."""
++import csv
++import io
++
++import pytest
++from botocore.exceptions import ClientError
++
++from cloudguard.core.export import findings_to_csv
++from cloudguard.core.rules import attach_rule_metadata
++from cloudguard.scanners.s3_scanner import S3Scanner
++from evaluation.evaluate import evaluate, load
++
++
++PUBLIC_GROUP = "http://acs.amazonaws.com/groups/global/AllUsers"
++ALL_BPA_FLAGS = {
++    "BlockPublicAcls": True,
++    "IgnorePublicAcls": True,
++    "BlockPublicPolicy": True,
++    "RestrictPublicBuckets": True,
++}
++
++
++def aws_error(code, operation):
++    return ClientError(
++        {"Error": {"Code": code, "Message": f"simulated {code}"}}, operation
++    )
++
++
++class Identity:
++    def get_caller_identity(self):
++        return {"Account": "123456789012"}
++
++
++class S3Stub:
++    def __init__(self, bucket_bpa=None, policy_public=True, public_acl=True,
++                 list_error=None, policy_error=None, acl_error=None):
++        self.bucket_bpa = bucket_bpa
++        self.policy_public = policy_public
++        self.public_acl = public_acl
++        self.list_error = list_error
++        self.policy_error = policy_error
++        self.acl_error = acl_error
++
++    def list_buckets(self):
++        if self.list_error:
++            raise self.list_error
++        return {"Buckets": [{"Name": "review-bucket"}]}
++
++    def get_public_access_block(self, Bucket):
++        if isinstance(self.bucket_bpa, Exception):
++            raise self.bucket_bpa
++        return {"PublicAccessBlockConfiguration": self.bucket_bpa or {}}
++
++    def get_bucket_policy_status(self, Bucket):
++        if self.policy_error:
++            raise self.policy_error
++        return {"PolicyStatus": {"IsPublic": self.policy_public}}
++
++    def get_bucket_acl(self, Bucket):
++        if self.acl_error:
++            raise self.acl_error
++        grants = []
++        if self.public_acl:
++            grants.append({
++                "Grantee": {"Type": "Group", "URI": PUBLIC_GROUP},
++                "Permission": "READ",
++            })
++        return {"Grants": grants}
++
++
++class S3ControlStub:
++    def __init__(self, account_bpa=None):
++        self.account_bpa = account_bpa
++
++    def get_public_access_block(self, AccountId):
++        if isinstance(self.account_bpa, Exception):
++            raise self.account_bpa
++        return {"PublicAccessBlockConfiguration": self.account_bpa or {}}
++
++
++class SessionStub:
++    def __init__(self, account_bpa=None, bucket_bpa=None, **s3_kwargs):
++        self.s3 = S3Stub(bucket_bpa=bucket_bpa, **s3_kwargs)
++        self.s3control = S3ControlStub(account_bpa)
++
++    def client(self, service):
++        return {
++            "s3": self.s3,
++            "s3control": self.s3control,
++            "sts": Identity(),
++        }[service]
++
++
++def scan(**kwargs):
++    return S3Scanner(session=SessionStub(**kwargs)).scan()
++
++
++def test_effective_flag_has_enabled_disabled_and_unknown_states():
++    assert S3Scanner.effective_flag("RestrictPublicBuckets", ALL_BPA_FLAGS, None) == "enabled"
++    assert S3Scanner.effective_flag("RestrictPublicBuckets", {}, {}) == "disabled"
++    assert S3Scanner.effective_flag("RestrictPublicBuckets", None, {}) == "unknown"
++    assert S3Scanner.effective_flag("RestrictPublicBuckets", {}, None) == "unknown"
++
++
++def test_account_access_denied_does_not_confirm_public_policy_or_acl():
++    result = scan(
++        account_bpa=aws_error("AccessDenied", "GetAccountPublicAccessBlock"),
++        bucket_bpa={},
++    )
++    checks = {finding["check"] for finding in result["findings"]}
++    assert "PUBLIC_BUCKET_POLICY" not in checks
++    assert "PUBLIC_BUCKET_ACL" not in checks
++    assert "PUBLIC_BUCKET_POLICY_PROTECTION_UNKNOWN" in checks
++    assert "PUBLIC_BUCKET_ACL_PROTECTION_UNKNOWN" in checks
++    assert next(f for f in result["findings"] if f["check"] == "PUBLIC_BUCKET_POLICY_PROTECTION_UNKNOWN")["severity"] == "INFO"
++    account_errors = [e for e in result["errors"] if e["operation"] == "GetAccountPublicAccessBlock"]
++    assert len(account_errors) == 1
++    assert account_errors[0]["scope"] == "account"
++    assert account_errors[0]["error"] == "AccessDenied"
++    assert result["successfully_inspected_buckets"] == 0
++
++
++def test_bucket_access_denied_does_not_confirm_public_policy_or_acl():
++    result = scan(
++        account_bpa={},
++        bucket_bpa=aws_error("AccessDenied", "GetPublicAccessBlock"),
++    )
++    checks = {finding["check"] for finding in result["findings"]}
++    assert "PUBLIC_BUCKET_POLICY" not in checks
++    assert "PUBLIC_BUCKET_ACL" not in checks
++    assert "PUBLIC_BUCKET_POLICY_PROTECTION_UNKNOWN" in checks
++    assert "PUBLIC_BUCKET_ACL_PROTECTION_UNKNOWN" in checks
++    bucket_errors = [e for e in result["errors"] if e["operation"] == "GetPublicAccessBlock"]
++    assert len(bucket_errors) == 1
++    assert bucket_errors[0]["scope"] == "bucket"
++    assert bucket_errors[0]["resource"] == "review-bucket"
++    assert result["successfully_inspected_buckets"] == 0
++
++
++def test_unknown_flags_are_not_misreported_as_disabled():
++    scanner = S3Scanner(session=SessionStub(
++        account_bpa=aws_error("AccessDenied", "GetAccountPublicAccessBlock"),
++        bucket_bpa={},
++        policy_public=False,
++        public_acl=False,
++    ))
++    scanner.findings, scanner.errors = [], []
++    scanner.check_block_public_access("review-bucket", None, {})
++    finding = next(f for f in scanner.findings if f["check"] == "BLOCK_PUBLIC_ACCESS_CONFIGURATION_UNKNOWN")
++    states = finding["evidence"]["effective_protection_flags"]
++    assert set(states.values()) == {"unknown"}
++    assert finding["evidence"]["disabled_flags"] == []
++    assert finding["evidence"]["unknown_flags"] == list(states)
++
++
++def test_account_and_bucket_access_denied_are_recorded_separately():
++    result = scan(
++        account_bpa=aws_error("AccessDenied", "GetAccountPublicAccessBlock"),
++        bucket_bpa=aws_error("AccessDenied", "GetPublicAccessBlock"),
++    )
++    failures = [e for e in result["errors"] if e["error"] == "AccessDenied"]
++    assert {(e["scope"], e["operation"]) for e in failures} == {
++        ("account", "GetAccountPublicAccessBlock"),
++        ("bucket", "GetPublicAccessBlock"),
++    }
++
++
++def test_account_error_is_preserved_when_list_buckets_later_fails():
++    result = scan(
++        account_bpa=aws_error("AccessDenied", "GetAccountPublicAccessBlock"),
++        bucket_bpa={},
++        list_error=aws_error("ServiceUnavailable", "ListBuckets"),
++    )
++    operations = [error["operation"] for error in result["errors"]]
++    assert operations == ["GetAccountPublicAccessBlock", "ListBuckets"]
++    assert result["discovered_buckets"] == 0
++    assert result["attempted_buckets"] == 0
++    assert result["successfully_inspected_buckets"] == 0
++
++
++def test_missing_configuration_is_known_disabled_not_unknown():
++    result = scan(account_bpa={}, bucket_bpa={}, policy_public=True, public_acl=True)
++    checks = {finding["check"] for finding in result["findings"]}
++    assert "PUBLIC_BUCKET_POLICY" in checks
++    assert "PUBLIC_BUCKET_ACL" in checks
++    assert "PUBLIC_BUCKET_POLICY_PROTECTION_UNKNOWN" not in checks
++    assert "PUBLIC_BUCKET_ACL_PROTECTION_UNKNOWN" not in checks
++    assert result["successfully_inspected_buckets"] == 1
++
++
++def test_rule_metadata_preserves_low_acl_context():
++    finding = {
++        "check": "PUBLIC_BUCKET_ACL",
++        "severity": "LOW",
++        "recommendation": "Remove residual ACL grants after confirming they are ignored.",
++    }
++    original_recommendation = finding["recommendation"]
++    attach_rule_metadata(finding)
++    assert finding["rule_id"] == "S3-02"
++    assert finding["severity"] == "LOW"
++    assert finding["recommendation"] == original_recommendation
++
++
++def test_rule_metadata_preserves_medium_policy_context():
++    finding = {
++        "check": "PUBLIC_BUCKET_POLICY",
++        "severity": "MEDIUM",
++        "recommendation": "Review the public policy; RestrictPublicBuckets is active.",
++    }
++    original_recommendation = finding["recommendation"]
++    attach_rule_metadata(finding)
++    assert finding["rule_id"] == "S3-01"
++    assert finding["severity"] == "MEDIUM"
++    assert finding["recommendation"] == original_recommendation
++
++
++def test_rule_metadata_still_supplies_missing_defaults():
++    finding = {"check": "EBS_VOLUME_UNENCRYPTED"}
++    attach_rule_metadata(finding)
++    assert finding["severity"] == "MEDIUM"
++    assert finding["recommendation"]
++    assert finding["rule_id"] == "ENC-02"
++
++
++def test_evaluation_requires_exact_resource_id_not_substring_match():
++    ground_truth = [{
++        "resource_type": "ec2_security_group", "resource_id": "sg-1",
++        "rule_id": "EC2-01", "expected": "FAIL",
++    }]
++    findings = [{
++        "resource_type": "ec2_security_group", "resource_id": "sg-10",
++        "rule_id": "EC2-01",
++    }]
++    tp, fp, fn, tn, detail, unlabelled = evaluate(ground_truth, findings)
++    assert (tp, fp, fn, tn) == (0, 0, 1, 0)
++    assert len(unlabelled) == 1
++
++
++def test_evaluation_requires_exact_resource_type_and_rule():
++    ground_truth = [{
++        "resource_type": "iam_user", "resource_id": "admin-user",
++        "rule_id": "IAM-03", "expected": "FAIL",
++    }]
++    wrong_type = [{
++        "resource_type": "s3_bucket", "resource_id": "admin-user",
++        "rule_id": "IAM-03",
++    }]
++    tp, fp, fn, tn, _, _ = evaluate(ground_truth, wrong_type)
++    assert (tp, fp, fn, tn) == (0, 0, 1, 0)
++
++
++@pytest.mark.parametrize("bad_expected", ["", "MAYBE", "TRUE", "N/A"])
++def test_evaluation_rejects_invalid_expected_labels(bad_expected):
++    ground_truth = [{
++        "resource_type": "s3_bucket", "resource_id": "bucket-a",
++        "rule_id": "S3-01", "expected": bad_expected,
++    }]
++    with pytest.raises(ValueError, match="expected must be PASS or FAIL"):
++        evaluate(ground_truth, [])
++
++
++@pytest.mark.parametrize("field", ["resource_type", "resource_id", "rule_id"])
++def test_evaluation_rejects_empty_identity_fields(field):
++    row = {
++        "resource_type": "s3_bucket", "resource_id": "bucket-a",
++        "rule_id": "S3-01", "expected": "PASS",
++    }
++    row[field] = "  "
++    with pytest.raises(ValueError, match="must not be empty"):
++        evaluate([row], [])
++
++
++def test_evaluation_rejects_duplicate_ground_truth_records():
++    row = {
++        "resource_type": "s3_bucket", "resource_id": "bucket-a",
++        "rule_id": "S3-01", "expected": "PASS",
++    }
++    with pytest.raises(ValueError, match="duplicate record"):
++        evaluate([row, dict(row, expected="FAIL")], [])
++
++
++def test_evaluation_rejects_findings_missing_explicit_identity():
++    gt = [{
++        "resource_type": "s3_bucket", "resource_id": "bucket-a",
++        "rule_id": "S3-01", "expected": "FAIL",
++    }]
++    with pytest.raises(ValueError, match="missing required field"):
++        evaluate(gt, [{"resource_id": "bucket-a", "rule_id": "S3-01"}])
++
++
++def test_evaluation_csv_loader_and_export_schema_are_compatible(tmp_path):
++    csv_text = findings_to_csv({"findings": [{
++        "service": "EC2", "resource": "sg-0123", "check": "INTERNET_EXPOSED_SSH",
++        "severity": "HIGH", "title": "SSH open", "description": "test",
++        "recommendation": "restrict ingress",
++    }]})
++    rows = list(csv.DictReader(io.StringIO(csv_text)))
++    assert rows[0]["resource_type"] == "ec2_security_group"
++    assert rows[0]["resource_id"] == "sg-0123"
++    path = tmp_path / "findings.csv"
++    path.write_text(csv_text, encoding="utf-8")
++    loaded = load(path)
++    gt = [{
++        "resource_type": "ec2_security_group", "resource_id": "sg-0123",
++        "rule_id": "EC2-01", "expected": "FAIL",
++    }]
++    assert evaluate(gt, loaded)[0:4] == (1, 0, 0, 0)
++
++
++def test_ground_truth_template_contains_only_implemented_rule_checks():
++    from pathlib import Path
++
++    sample_path = Path(__file__).resolve().parents[1] / "evaluation" / "ground_truth_template.csv"
++    records = load(sample_path)
++    normalized = [row["rule_id"] for row in records]
++    assert set(normalized) == {
++        "S3-01", "S3-02", "S3-03", "EC2-01", "EC2-02",
++        "IAM-02", "IAM-03", "ENC-02", "LOG-02",
++    }
++    assert "LOG-01" not in normalized  # no CloudTrail no-trail evaluation rule mapping
++    assert "ENC-01" not in normalized  # EBS encryption-by-default is not scanned
++    # The evaluation template itself must pass all strict CSV validation.
++    from evaluation.evaluate import validate_ground_truth
++    assert len(validate_ground_truth(records)) == len(records)
++
++
++def test_no_such_public_access_block_is_a_known_disabled_configuration():
++    result = scan(
++        account_bpa=aws_error(
++            "NoSuchPublicAccessBlockConfiguration", "GetAccountPublicAccessBlock"
++        ),
++        bucket_bpa=aws_error(
++            "NoSuchPublicAccessBlockConfiguration", "GetPublicAccessBlock"
++        ),
++    )
++    checks = {finding["check"] for finding in result["findings"]}
++    assert "PUBLIC_BUCKET_POLICY" in checks
++    assert "PUBLIC_BUCKET_ACL" in checks
++    assert "PUBLIC_BUCKET_POLICY_PROTECTION_UNKNOWN" not in checks
++    assert "PUBLIC_BUCKET_ACL_PROTECTION_UNKNOWN" not in checks
++    assert result["errors"] == []
++    assert result["successfully_inspected_buckets"] == 1
++
++
++def test_bucket_can_be_fully_inspected_when_bucket_settings_resolve_unknown_account_flags():
++    result = scan(
++        account_bpa=aws_error("AccessDenied", "GetAccountPublicAccessBlock"),
++        bucket_bpa=ALL_BPA_FLAGS,
++        policy_public=False,
++        public_acl=False,
++    )
++    assert result["discovered_buckets"] == 1
++    assert result["attempted_buckets"] == 1
++    assert result["successfully_inspected_buckets"] == 1
++    # Account-level failure remains visible independently of bucket-level success.
++    assert result["errors"][0]["scope"] == "account"
++
++
++def test_unmapped_findings_remain_unlabelled_instead_of_invalidating_evaluation():
++    gt = [{
++        "resource_type": "s3_bucket", "resource_id": "expected-bucket",
++        "rule_id": "S3-01", "expected": "FAIL",
++    }]
++    findings = [{
++        "resource_type": "rds_db_instance", "resource_id": "public-db",
++        "rule_id": "",  # RDS_PUBLICLY_ACCESSIBLE is not in the P1 rule mapping.
++    }]
++    tp, fp, fn, tn, detail, unlabelled = evaluate(gt, findings)
++    assert (tp, fp, fn, tn) == (0, 0, 1, 0)
++    assert unlabelled == findings
++
++
++@pytest.mark.parametrize("flag", [
++    "BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets",
++])
++def test_each_bpa_flag_uses_or_effective_state_across_account_and_bucket(flag):
++    account_enabled = {flag: True}
++    bucket_disabled = {flag: False}
++    account_disabled = {flag: False}
++    bucket_enabled = {flag: True}
++    assert S3Scanner.effective_flag(flag, account_enabled, bucket_disabled) == "enabled"
++    assert S3Scanner.effective_flag(flag, account_disabled, bucket_enabled) == "enabled"
++    assert S3Scanner.effective_flag(flag, account_disabled, bucket_disabled) == "disabled"
++    assert S3Scanner.effective_flag(flag, None, bucket_disabled) == "unknown"
+--- a/tests/test_v2_integration.py
++++ b/tests/test_v2_integration.py
+@@ -54,7 +54,10 @@
+ 
+ def test_s3_bucket_failure_is_isolated():
+     result = S3Scanner(session=MultiBucketSession()).scan()
+-    assert result["scanned_buckets"] == 3
++    assert result["discovered_buckets"] == 3
++    assert result["attempted_buckets"] == 3
++    assert result["successfully_inspected_buckets"] == 2
++    assert result["scanned_buckets"] == 2
+     assert any(e.get("resource") == "bad" for e in result["errors"])
+     assert len(result["errors"]) == 1
+ 
+@@ -69,14 +72,14 @@
+ 
+ def test_evaluation_confusion_matrix_and_metrics_inputs():
+     gt = [
+-        {"resource": "public-bucket", "rule_id": "S3-01", "expected": "FAIL"},
+-        {"resource": "private-bucket", "rule_id": "S3-01", "expected": "PASS"},
+-        {"resource": "missing-bucket", "rule_id": "S3-01", "expected": "FAIL"},
+-        {"resource": "clean-bucket", "rule_id": "S3-01", "expected": "PASS"},
++        {"resource_type": "s3_bucket", "resource_id": "public-bucket", "rule_id": "S3-01", "expected": "FAIL"},
++        {"resource_type": "s3_bucket", "resource_id": "private-bucket", "rule_id": "S3-01", "expected": "PASS"},
++        {"resource_type": "s3_bucket", "resource_id": "missing-bucket", "rule_id": "S3-01", "expected": "FAIL"},
++        {"resource_type": "s3_bucket", "resource_id": "clean-bucket", "rule_id": "S3-01", "expected": "PASS"},
+     ]
+     findings = [
+-        {"resource": "public-bucket", "rule_id": "S3-01"},
+-        {"resource": "private-bucket", "rule_id": "S3-01"},
++        {"resource_type": "s3_bucket", "resource_id": "public-bucket", "rule_id": "S3-01"},
++        {"resource_type": "s3_bucket", "resource_id": "private-bucket", "rule_id": "S3-01"},
+     ]
+     tp, fp, fn, tn, detail, unlabelled = evaluate(gt, findings)
+     assert (tp, fp, fn, tn) == (1, 1, 1, 1)
+@@ -121,6 +124,8 @@
+     }]})
+     rows = list(csv.DictReader(io.StringIO(csv_text)))
+     assert rows[0]["rule_id"] == "S3-01"
++    assert rows[0]["resource_type"] == "s3_bucket"
++    assert rows[0]["resource_id"] == "demo-bucket"
+     assert rows[0]["resource"] == "demo-bucket"
+ 
+ 

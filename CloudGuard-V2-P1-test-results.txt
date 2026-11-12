@@ -1,0 +1,17 @@
+CloudGuard V2 P1 corrections - offline test run
+Python: Python 3.13.5
+AWS access key/secret/session token: dummy offline values only
+AWS_EC2_METADATA_DISABLED=true
+
+Command:
+python -m compileall -q app.py cloudguard evaluation tests
+RESULT: PASS (no compile errors)
+
+Command:
+AWS_EC2_METADATA_DISABLED=true AWS_ACCESS_KEY_ID=offline-test AWS_SECRET_ACCESS_KEY=offline-test AWS_SESSION_TOKEN=offline-test AWS_DEFAULT_REGION=us-east-1 AWS_PROFILE= python -m pytest -q -rs
+........................................................................ [ 93%]
+.....                                                                    [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_app.py:4: Install requirements.txt to run Flask route tests
+SKIPPED [1] tests/test_moto_smoke.py:4: could not import 'moto': No module named 'moto'
+77 passed, 2 skipped in 0.46s
